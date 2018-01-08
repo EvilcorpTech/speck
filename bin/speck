@@ -1,0 +1,110 @@
+#!/usr/bin/env sh
+
+set -e ## errexit
+set -u ## nounset
+
+IFS='
+'
+CmdDir="$(cd "$(dirname "$0")" && pwd)"
+VerboseFlag=no
+DebugFlag=no
+ExitStatus=0
+
+: ${SpeckSuiteStyle:=* %s\\n}
+: ${SpeckFuncStyle:=        %s}
+: ${SpeckOkStatusStyle:=\\r  ok\\n}
+: ${SpeckErrorStatusStyle:=\\r  error\\n}
+: ${SpeckDumpStyle:=s:^:> :}
+
+before() { true; }
+after()  { true; }
+
+usage()
+{
+        echo "Usage: $(basename "$0") [ -v,--verbose ] [ -d,--debug ] [ <file_or_dir> ... ]"
+}
+
+run_spec()
+{(
+        set -e
+
+        spec_file="$1"
+        spec_func="$2"
+
+         __dir__="$(dirname "$spec_file")"
+        __file__="$spec_file"
+
+        . "$spec_file"
+
+        before
+
+        printf -- "$SpeckFuncStyle" "$spec_func"
+
+        set +e
+        output="$(set -e; $spec_func 2>&1)"
+        exit_status=$?
+        set -e
+
+        if test $exit_status -gt 0; then
+                printf -- "$SpeckErrorStatusStyle"
+        else
+                printf -- "$SpeckOkStatusStyle"
+        fi
+
+        after
+
+        if test -n "$output" -a "$VerboseFlag" = 'yes'; then
+                dump "$output"
+        fi
+
+        return $exit_status
+)}
+
+dump()
+{
+        cat <<OUT | sed -e "$SpeckDumpStyle"
+$@
+OUT
+}
+
+main()
+{
+        while test $# -gt 0; do
+                case $1 in
+                        -v|--verbose) VerboseFlag=yes; shift;;
+                        -d|--debug)   DebugFlag=yes;   shift;;
+                        -*)           usage; exit 1;;
+                        --) shift;;
+                esac
+        done
+
+        if test "$DebugFlag" = 'yes'; then
+                set -x ## xtrace
+        fi
+
+        if test $# -eq 0; then
+                set -- "$CmdDir"
+        fi
+
+        set +e
+
+        for suite; do
+                for spec_file in $(find -L "$suite" -type f -maxdepth 2 | grep -E '_(spec|test).sh$' | sort -n); do
+                        printf -- "$SpeckSuiteStyle" "${spec_file#$CmdDir/}"
+
+                        for spec_func in $(grep -Eo '^(it|test)[_[:alnum:]]+\(\)' "$spec_file"); do
+                                run_spec "$spec_file" "${spec_func%%\(*}"
+
+                                ExitStatus=$(expr $ExitStatus + $?)
+                        done
+                done
+        done
+
+        if test $ExitStatus -gt 0; then
+                echo "failed ($ExitStatus)"
+        fi
+
+        return $ExitStatus
+}
+
+main "$@"
