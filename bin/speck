@@ -16,32 +16,53 @@ ExitStatus=0
 : ${SpeckErrorStatusStyle:=\\r  error\\n}
 : ${SpeckDumpStyle:=s:^:> :}
 
-before() { true; }
-after()  { true; }
+before_all() { true; }
+before()     { true; }
+after()      { true; }
+after_all()  { true; }
 
 usage()
 {
         echo "Usage: $(basename "$0") [ -v,--verbose ] [ -d,--debug ] [ <file_or_dir> ... ]"
 }
 
-run_spec()
+run_spec_file()
 {(
         set -e
 
-        spec_file="$1"
-        spec_func="$2"
+        exit_status=0
 
-         __dir__="$(dirname "$spec_file")"
+        printf -- "$SpeckSuiteStyle" "${spec_file#$CmdDir/}"
+
+        __dir__="$(dirname "$spec_file")"
         __file__="$spec_file"
 
         . "$spec_file"
 
-        before
-
-        printf -- "$SpeckFuncStyle" "$spec_func"
+        before_all
 
         set +e
-        output="$(set -e; $spec_func 2>&1)"
+        for spec_func in $(grep -Eo '^(it|test)[_[:alnum:]]+\(\)' "$spec_file"); do
+                run_spec_func "${spec_func%%\(*}"
+                exit_status=$(expr $exit_status + $?)
+        done
+        set -e
+
+        after_all
+
+        return $exit_status
+)}
+
+run_spec_func()
+{(
+        set -e
+
+        before
+
+        printf -- "$SpeckFuncStyle" "$1"
+
+        set +e
+        output="$(set -e; $1 2>&1)"
         exit_status=$?
         set -e
 
@@ -87,18 +108,13 @@ main()
         fi
 
         set +e
-
         for suite; do
                 for spec_file in $(find -L "$suite" -type f -maxdepth 2 | grep -E '_(spec|test).sh$' | sort -n); do
-                        printf -- "$SpeckSuiteStyle" "${spec_file#$CmdDir/}"
-
-                        for spec_func in $(grep -Eo '^(it|test)[_[:alnum:]]+\(\)' "$spec_file"); do
-                                run_spec "$spec_file" "${spec_func%%\(*}"
-
-                                ExitStatus=$(expr $ExitStatus + $?)
-                        done
+                        run_spec_file "$spec_file"
+                        ExitStatus=$(expr $ExitStatus + $?)
                 done
         done
+        set -e
 
         if test $ExitStatus -gt 0; then
                 echo "failed ($ExitStatus)"
