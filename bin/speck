@@ -8,18 +8,52 @@ IFS='
 CmdDir="$(cd "$(dirname "$0")" && pwd)"
 VerboseFlag=no
 DebugFlag=no
-ExitStatus=0
 
-: ${SpeckSuiteStyle:=* %s\\n}
+: ${ResetStyle:=$(tput sgr0)}
+: ${BoldStyle:=$(tput bold)}
+: ${ReverseStyle:=$(tput rev)}
+
+: ${GreenStyle:=$(tput setaf 120)}
+: ${YellowStyle:=$(tput setaf 229)}
+: ${RedStyle:=$(tput setaf 160)}
+: ${BlueStyle:=$(tput setaf 75)}
+: ${GrayStyle:=$(tput setaf 239)}
+
+if test $(tput colors) -le 8; then
+        GreenStyle="$(tput setaf 2)"
+        YellowStyle="$(tput setaf 3)"
+        RedStyle="$(tput setaf 1)"
+        BlueStyle="$(tput setaf 4)"
+        GrayStyle="$(tput setaf 8)"
+fi
+
+if test ! -t 1 -o -p /dev/stdout; then
+        ## We are redirected or in a pipe.
+        ResetStyle=
+        ReverseStyle=
+        GreenStyle=
+        YellowStyle=
+        RedStyle=
+        BlueStyle=
+        GrayStyle=
+fi
+
+ErrorStyle="$RedStyle"
+WarningStyle="$YellowStyle"
+SuccessStyle="$GreenStyle"
+DimmedStyle="$GrayStyle"
+
+: ${SpeckSuiteStyle:=%s\\n}
 : ${SpeckFuncStyle:=        %s}
-: ${SpeckOkStatusStyle:=\\r  ok\\n}
-: ${SpeckErrorStatusStyle:=\\r  error\\n}
+: ${SpeckOkStatusStyle:=\\r  ${SuccessStyle}ok${ResetStyle}\\n}
+: ${SpeckErrorStatusStyle:=\\r  ${ErrorStyle}error${ResetStyle}\\n}
 : ${SpeckDumpStyle:=s:^:> :}
+: ${SpeckSummaryStyle:=\\nfailed(${ErrorStyle}${BoldStyle}\{errors\}${ResetStyle})  success(${SuccessStyle}${BoldStyle}\{completed\}${ResetStyle})  total(${BlueStyle}${BoldStyle}\{specs\}${ResetStyle})\\n}
 
-before_all() { true; }
-before()     { true; }
-after()      { true; }
-after_all()  { true; }
+before_all() { :; }
+before()     { :; }
+after()      { :; }
+after_all()  { :; }
 
 usage()
 {
@@ -32,17 +66,17 @@ run_spec_file()
 
         exit_status=0
 
-        printf -- "$SpeckSuiteStyle" "${spec_file#$CmdDir/}"
+        printf -- "$SpeckSuiteStyle" "${1#$CmdDir/}"
 
-        __dir__="$(dirname "$spec_file")"
-        __file__="$spec_file"
+        __dir__="$(dirname "$1")"
+        __file__="$1"
 
-        . "$spec_file"
+        . "$1"
 
         before_all
 
         set +e
-        for spec_func in $(grep -Eo '^(it|test)[_[:alnum:]]+\(\)' "$spec_file"); do
+        for spec_func in $2; do
                 run_spec_func "${spec_func%%\(*}"
                 exit_status=$(expr $exit_status + $?)
         done
@@ -59,10 +93,11 @@ run_spec_func()
 
         before
 
-        printf -- "$SpeckFuncStyle" "$1"
+        printf -- "$SpeckFuncStyle" "$1" | tr '_' ' '
 
         set +e
         output="$(set -e; $1 2>&1)"
+        test $? -eq 0   ## Converts an exit status different from 0 to 1.
         exit_status=$?
         set -e
 
@@ -107,20 +142,32 @@ main()
                 set -- "$CmdDir"
         fi
 
+        local exit_status=0
+        local specs_count=0
+
         set +e
         for suite; do
                 for spec_file in $(find -L "$suite" -type f -maxdepth 2 | grep -E '_(spec|test).sh$' | sort -n); do
-                        run_spec_file "$spec_file"
-                        ExitStatus=$(expr $ExitStatus + $?)
+                        local spec_funcs="$(grep -Eo '^(it|test)[_[:alnum:]]+\(\)' "$spec_file")"
+                        local spec_count="$(wc -l <<EOF | tr -d ' '
+$spec_funcs
+EOF
+)"
+
+                        run_spec_file "$spec_file" "$spec_funcs"
+
+                        exit_status=$(expr $exit_status + $?)
+                        specs_count=$(expr $specs_count + $spec_count)
                 done
         done
         set -e
 
-        if test $ExitStatus -gt 0; then
-                echo "failed ($ExitStatus)"
-        fi
+        printf -- "$SpeckSummaryStyle" \
+        | sed -e "s:{errors}:$exit_status:g" \
+              -e "s:{completed}:$(expr $specs_count - $exit_status):g" \
+              -e "s:{specs}:$specs_count:g"
 
-        return $ExitStatus
+        return $exit_status
 }
 
 main "$@"
