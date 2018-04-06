@@ -1,15 +1,18 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
+
+## For tests with Bash 3 on MacOS.
+#!/bin/bash
 
 set -e ## errexit
 set -u ## nounset
 
 IFS='
 '
-CmdDir="$(cd "$(dirname "$0")" && pwd)"
+SpeckCmdDir="$(cd "$(dirname "$0")" && pwd)"
 VerboseFlag=no
 DebugFlag=no
-MessageBuffer="$(mktemp)"
-ProgressBuffer="$(mktemp)"
+MessageBuffer=
+ProgressBuffer=
 
 : ${ResetStyle:=$(tput sgr0)}
 : ${BoldStyle:=$(tput bold)}
@@ -60,24 +63,162 @@ before()     { :; }
 after()      { :; }
 after_all()  { :; }
 
+main()
+{
+        while test $# -gt 0; do
+                case $1 in
+                        -v|--verbose) VerboseFlag=yes; shift;;
+                        -d|--debug) DebugFlag=yes; shift;;
+                        --) shift; break;;
+                        -*) usage; exit 1;;
+                        *) break;;
+                esac
+        done
+
+        if test "$DebugFlag" = 'yes'; then
+                set -x ## xtrace
+        fi
+
+        if test $# -eq 0; then
+                while read -r dir; do
+                        if test -e "$dir"; then
+                                set -- "$dir"
+                                break
+                        fi
+                done <<EOF
+$PWD/spec
+$PWD/specs
+$PWD/test
+$PWD/tests
+$SpeckCmdDir/spec
+$SpeckCmdDir/specs
+$SpeckCmdDir/test
+$SpeckCmdDir/tests
+EOF
+        fi
+
+        run_suites "$@"
+}
+
 usage()
 {
         echo "Usage: $(basename "$0") [ -v,--verbose ] [ -d,--debug ] [ <file_or_dir> ... ]"
+}
+
+clean()
+{
+        test ! -e "$MessageBuffer" || rm -f "$MessageBuffer"
+        test ! -e "$ProgressBuffer" || rm -f "$ProgressBuffer"
+}
+
+run_suites()
+{
+        MessageBuffer="$(mktemp)"
+        ProgressBuffer="$(mktemp)"
+
+        local plan=''
+        local exit_status=0
+        local suites_total=$#
+        local specs_total=0
+        local checks_total=0
+        local suites_count=0
+        local specs_count=0
+        local checks_count=0
+
+        for suite; do
+                local suite_dir="${suite%/}"
+
+                ## Workaround for a Bash 3 bug that prevents 'cd dir'
+                ## when 'dir' is not written as './dir'.
+                case "$suite_dir" in
+                          /*) ;;
+                          *) suite_dir="$PWD/$suite_dir";;
+                esac
+
+                ## Normalizes a path (with ..).
+                suite_dir="$(cd "$suite_dir" && pwd)"
+
+                local specs_files="$(find -L "$suite_dir" -type f -maxdepth 2 | grep -E '_(spec|test).sh$' | sort -n)"
+                specs_total=$(expr $specs_total + $(count_lines "$specs_files") || true)
+
+                for spec_file in $specs_files; do
+                        local spec_checks="$(grep -Eo '^(it|test)[_[:alnum:]]+\(\)' "$spec_file")"
+                        checks_total=$(expr $checks_total + $(count_lines "$spec_checks") || true)
+
+                        plan="${plan}\
+suite:$suite_dir
+spec:$spec_file
+checks:$(printf -- '%s' "$spec_checks" | tr '\n' ' ')
+" ## We need a new line at the end for 'read' to process it.
+                done
+        done
+
+        local prev_suite=
+        local prev_spec=
+        local suite=
+        local spec=
+        local checks=
+        local line_count=0
+        for line in $plan; do
+                line_count=$(expr $line_count + 1)
+
+                case $line_count in
+                        1) suite="${line#*:}"; continue;;
+                        2) spec="${line#*:}"; continue;;
+                        3) checks="${line#*:}"; line_count=0;;
+                esac
+
+                if test "$prev_suite" != "$suite"; then
+                        suites_count=$(expr $suites_count + 1)
+                fi
+
+                if test "$prev_spec" != "$spec"; then
+                        specs_count=$(expr $specs_count + 1)
+                fi
+
+                checks="$(printf -- '%s' "$checks" | tr ' ' '\n')"
+
+                set +e
+                run_spec "$suite" "$spec" "$checks"
+                exit_status="$(expr $exit_status + $? || true)"
+                set -e
+
+                checks_count=$(expr $checks_count + $(count_lines "$checks"))
+
+                prev_suite="$suite"
+                prev_spec="$spec"
+        done
+
+        if test $exit_status -eq 0; then
+                printf -- "$SpeckSuccessStyle"
+        else
+                printf -- "$SpeckErrorStyle"
+        fi
+
+        printf -- "$SpeckSummaryStyle" \
+        | sed -e "s:{errors}:$exit_status:g" \
+              -e "s:{completed}:$(expr $checks_count - $exit_status || true):g" \
+              -e "s:{specs}:$checks_count:g"
+
+        clean
+
+        return $exit_status
 }
 
 run_spec()
 {(
         set -e
 
-        local spec_file="$1"
-        local spec_checks="$2"
+        local suite="$1"
+        local spec_file="$2"
+        local spec_checks="$3"
         local spec_exit_status=0
 
-        printf -- "$SpeckSuiteStyle" "${1#$CmdDir/}" \
+        printf -- "$SpeckSuiteStyle" "${spec_file#$suite/}" \
         | output
 
-        __specdir__="$(dirname "$1")"
-        __specfile__="$1"
+        __specdir__="$(dirname "$spec_file")"
+        __specfile__="$spec_file"
 
         . "$spec_file"
 
@@ -164,94 +305,6 @@ count_lines()
         wc -l <<EOF | tr -d ' '
 $@
 EOF
-}
-
-main()
-{
-        while test $# -gt 0; do
-                case $1 in
-                        -v|--verbose) VerboseFlag=yes; shift;;
-                        -d|--debug)   DebugFlag=yes;   shift;;
-                        -*)           usage; exit 1;;
-                        --) shift;;
-                esac
-        done
-
-        if test "$DebugFlag" = 'yes'; then
-                set -x ## xtrace
-        fi
-
-        if test $# -eq 0; then
-                set -- "$CmdDir"
-        fi
-
-        local plan=''
-        local exit_status=0
-        local suites_total=$#
-        local specs_total=0
-        local checks_total=0
-        local suites_count=0
-        local specs_count=0
-        local checks_count=0
-
-        for suite; do
-                local specs_files="$(find -L "$suite" -type f -maxdepth 2 | grep -E '_(spec|test).sh$' | sort -n)"
-                specs_total=$(expr $specs_total + $(count_lines "$specs_files") || true)
-
-                for spec_file in $specs_files; do
-                        local spec_checks="$(grep -Eo '^(it|test)[_[:alnum:]]+\(\)' "$spec_file")"
-                        checks_total=$(expr $checks_total + $(count_lines "$spec_checks") || true)
-
-                        plan="${plan}\
-suite:$suite
-spec:$spec_file
-checks:$(printf -- '%s' "$spec_checks" | tr '\n' ' ')
-" ## We need a new line at the end for 'read' to process it.
-                done
-        done
-
-        local prev_suite=
-        local prev_spec=
-        while IFS= read -r next_suite; read -r next_spec; read -r next_checks; do
-                if test "$prev_suite" != "$next_suite"; then
-                        suites_count=$(expr $suites_count + 1)
-                fi
-
-                if test "$prev_spec" != "$next_spec"; then
-                        specs_count=$(expr $specs_count + 1)
-                fi
-
-                local spec_file="${next_spec#*:}"
-                local spec_checks="$(printf -- '%s' "${next_checks#*:}" | tr ' ' '\n')"
-
-                set +e
-                run_spec "$spec_file" "$spec_checks"
-                exit_status="$(expr $exit_status + $? || true)"
-                set -e
-
-                checks_count=$(expr $checks_count + $(count_lines "$spec_checks"))
-
-                prev_suite="$next_suite"
-                prev_spec="$next_spec"
-        done <<EOF
-$plan
-EOF
-
-        if test $exit_status -eq 0; then
-                printf -- "$SpeckSuccessStyle"
-        else
-                printf -- "$SpeckErrorStyle"
-        fi
-
-        printf -- "$SpeckSummaryStyle" \
-        | sed -e "s:{errors}:$exit_status:g" \
-              -e "s:{completed}:$(expr $checks_count - $exit_status || true):g" \
-              -e "s:{specs}:$checks_count:g"
-
-        rm -f "$MessageBuffer"
-        rm -f "$ProgressBuffer"
-
-        return $exit_status
 }
 
 main "$@"
