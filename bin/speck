@@ -11,7 +11,7 @@ IFS='
 SpeckCmdDir="$(cd "$(dirname "$0")" && pwd)"
 VerboseFlag=no
 DebugFlag=no
-MessageBuffer=
+LogBuffer=
 ProgressBuffer=
 
 : ${ResetStyle:=$(tput sgr0)}
@@ -48,15 +48,16 @@ WarningStyle="$YellowStyle"
 SuccessStyle="$GreenStyle"
 DimmedStyle="$GrayStyle"
 
-: ${SpeckSuiteStyle:=\\n%s\\n}
-: ${SpeckProgressStyle:=${ReverseStyle} suites(\{suites_count\}/\{suites_total\}) specs(\{specs_count\}/\{specs_total\}) checks(\{checks_count\}/\{checks_total\}) ${ResetStyle}}
+: ${SpeckDumpStyle:=s|^|${GrayStyle}> |}
+: ${SpeckSuiteStyle:=\\n%s:\\n\\n}
+: ${SpeckSpecStyle:=%s\\n}
+: ${SpeckProgressStyle:=${ReverseStyle} suites(\{suites_count\}/\{suites_total\}) specs(\{specs_count\}/\{specs_total\}) checks(\{checks_count\}/\{checks_total\})${ResetStyle}}
 : ${SpeckCheckProgressStyle:=          \{desc\}}
 : ${SpeckCheckSuccessStyle:=    ${SuccessStyle}ok${ResetStyle}    \{desc\}}
 : ${SpeckCheckErrorStyle:=  ${ErrorStyle}failed${ResetStyle}  \{desc\}}
-: ${SpeckSuccessStyle:=\\n${SuccessStyle}${ReverseStyle} Success ${ResetStyle}  }
-: ${SpeckErrorStyle:=\\n${ErrorStyle}${ReverseStyle} Error ${ResetStyle}  }
-: ${SpeckDumpStyle:=s:^:> :}
-: ${SpeckSummaryStyle:=failed(${ErrorStyle}${BoldStyle}\{errors\}${ResetStyle})  succeeded(${SuccessStyle}${BoldStyle}\{completed\}${ResetStyle})  total(${BlueStyle}${BoldStyle}\{specs\}${ResetStyle})\\n}
+: ${SpeckSuccessStyle:=${SuccessStyle}${ReverseStyle} ✓ Success ${ResetStyle}}
+: ${SpeckErrorStyle:=${ErrorStyle}${ReverseStyle} ✕ Error ${ResetStyle}}
+: ${SpeckSummaryStyle:=\\n\{status\}  failed(${ErrorStyle}${BoldStyle}\{errors\}${ResetStyle})  succeeded(${SuccessStyle}${BoldStyle}\{completed\}${ResetStyle})  total(${BlueStyle}${BoldStyle}\{specs\}${ResetStyle})\\n}
 
 before_all() { :; }
 before()     { :; }
@@ -100,21 +101,29 @@ EOF
         run_suites "$@"
 }
 
+onexit()
+{
+        tput cnorm      ## We restore cursor visibility.
+        tput sgr0       ## We restore foregroung and background styles.
+
+        test ! -e "$LogBuffer" || rm -f "$LogBuffer"
+        test ! -e "$ProgressBuffer" || rm -f "$ProgressBuffer"
+}
+
 usage()
 {
         echo "Usage: $(basename "$0") [ -v,--verbose ] [ -d,--debug ] [ <file_or_dir> ... ]"
 }
 
-clean()
-{
-        test ! -e "$MessageBuffer" || rm -f "$MessageBuffer"
-        test ! -e "$ProgressBuffer" || rm -f "$ProgressBuffer"
-}
-
 run_suites()
 {
-        MessageBuffer="$(mktemp)"
+        trap onexit TERM INT HUP EXIT
+
+        LogBuffer="$(mktemp)"
         ProgressBuffer="$(mktemp)"
+
+        tput clear              ## We clear the terminal.
+        tput civis              ## We hide th cursor.
 
         local plan=''
         local exit_status=0
@@ -126,28 +135,34 @@ run_suites()
         local checks_count=0
 
         for suite; do
-                local suite_dir="${suite%/}"
+                local suite_path="${suite%/}"
 
                 ## Workaround for a Bash 3 bug that prevents 'cd dir'
                 ## when 'dir' is not written as './dir'.
-                case "$suite_dir" in
+                case "$suite_path" in
                           /*) ;;
-                          *) suite_dir="$PWD/$suite_dir";;
+                          *) suite_path="$PWD/$suite_path";;
                 esac
 
-                ## Normalizes a path (with ..).
-                suite_dir="$(cd "$suite_dir" && pwd)"
+                ## We normalize a path with '..'.
+                if test -d "$suite_path"; then
+                        ## The suite is a directory.
+                        suite_path="$(cd "$suite_path" && pwd)"
+                else
+                        ## The suite is a file.
+                        suite_path="$(cd "$(dirname "$suite_path")" && pwd)/$(basename "$suite_path")"
+                fi
 
-                local specs_files="$(find -L "$suite_dir" -type f -maxdepth 2 | grep -E '_(spec|test).sh$' | sort -n)"
+                local specs_files="$(find -L "$suite_path" -type f -maxdepth 2 \( -name "*spec.sh" -or -name "*test.sh" \) | sort -n)"
                 specs_total=$(expr $specs_total + $(count_lines "$specs_files") || true)
 
-                for spec_file in $specs_files; do
-                        local spec_checks="$(grep -Eo '^(it|test)[_[:alnum:]]+\(\)' "$spec_file")"
+                for spec in $specs_files; do
+                        local spec_checks="$(grep -Eo '^(it|test)[_[:alnum:]]+\(\)' "$spec")"
                         checks_total=$(expr $checks_total + $(count_lines "$spec_checks") || true)
 
                         plan="${plan}\
-suite:$suite_dir
-spec:$spec_file
+suite:$suite_path
+spec:$spec
 checks:$(printf -- '%s' "$spec_checks" | tr '\n' ' ')
 " ## We need a new line at the end for 'read' to process it.
                 done
@@ -159,6 +174,7 @@ checks:$(printf -- '%s' "$spec_checks" | tr '\n' ' ')
         local spec=
         local checks=
         local line_count=0
+
         for line in $plan; do
                 line_count=$(expr $line_count + 1)
 
@@ -169,11 +185,8 @@ checks:$(printf -- '%s' "$spec_checks" | tr '\n' ' ')
                 esac
 
                 if test "$prev_suite" != "$suite"; then
-                        suites_count=$(expr $suites_count + 1)
-                fi
-
-                if test "$prev_spec" != "$spec"; then
-                        specs_count=$(expr $specs_count + 1)
+                        printf -- "$SpeckSuiteStyle" "${suite#$PWD/}" \
+                        | log
                 fi
 
                 checks="$(printf -- '%s' "$checks" | tr ' ' '\n')"
@@ -183,24 +196,33 @@ checks:$(printf -- '%s' "$spec_checks" | tr '\n' ' ')
                 exit_status="$(expr $exit_status + $? || true)"
                 set -e
 
+                if test "$prev_suite" != "$suite"; then
+                        suites_count=$(expr $suites_count + 1)
+                fi
+
+                if test "$prev_spec" != "$spec"; then
+                        specs_count=$(expr $specs_count + 1)
+                fi
+
                 checks_count=$(expr $checks_count + $(count_lines "$checks"))
+
+                progress $suites_count $suites_total $specs_count $specs_total $checks_count $checks_total
 
                 prev_suite="$suite"
                 prev_spec="$spec"
         done
 
+        local speck_status_style="$SpeckErrorStyle"
         if test $exit_status -eq 0; then
-                printf -- "$SpeckSuccessStyle"
-        else
-                printf -- "$SpeckErrorStyle"
+                speck_status_style="$SpeckSuccessStyle"
         fi
 
         printf -- "$SpeckSummaryStyle" \
-        | sed -e "s:{errors}:$exit_status:g" \
+        | sed -e "s:{status}:$speck_status_style:g" \
+              -e "s:{errors}:$exit_status:g" \
               -e "s:{completed}:$(expr $checks_count - $exit_status || true):g" \
-              -e "s:{specs}:$checks_count:g"
-
-        clean
+              -e "s:{specs}:$checks_count:g" \
+        | log
 
         return $exit_status
 }
@@ -210,22 +232,21 @@ run_spec()
         set -e
 
         local suite="$1"
-        local spec_file="$2"
-        local spec_checks="$3"
+        local spec="$2"
+        local checks="$3"
         local spec_exit_status=0
 
-        printf -- "$SpeckSuiteStyle" "${spec_file#$suite/}" \
-        | output
+        printf -- "$SpeckSpecStyle" "${spec#$suite/}" \
+        | log
 
-        __specdir__="$(dirname "$spec_file")"
-        __specfile__="$spec_file"
+        __specdir__="$(dirname "$spec")"
+        __specfile__="$spec"
 
-        . "$spec_file"
+        . "$spec"
 
         before_all
 
-        for spec_check in $spec_checks; do
-                checks_count=$(expr $checks_count + 1)
+        for spec_check in $checks; do
                 local spec_check_name="${spec_check%%\(*}"
                 local spec_check_desc="$(printf -- '%s' "$spec_check_name" | tr '_' ' ')"
 
@@ -236,8 +257,8 @@ run_spec()
                 before
 
                 printf -- "$SpeckCheckProgressStyle" \
-                | sed -e "s:{desc}:$spec_check_desc:g" \
-                | output
+                | sed -e "s|{desc}|$spec_check_desc|g" \
+                | log
 
                 set +e
                 output="$(set -e; $spec_check_name 2>&1)"
@@ -251,12 +272,12 @@ run_spec()
                 fi
 
                 printf -- "$(tput cuu1)$speck_check_style$(tput el)" \
-                | sed -e "s:{desc}:$spec_check_desc:g" \
-                | output
+                | sed -e "s|{desc}|$spec_check_desc|g" \
+                | log
 
                 if test -n "$output" -a "$VerboseFlag" = 'yes'; then
-                        cat <<OUT | sed -e "$SpeckDumpStyle" | output
-$output
+                        cat <<OUT | sed -e "$SpeckDumpStyle" | log
+${output}${ResetStyle}
 OUT
                 fi
 
@@ -265,7 +286,12 @@ OUT
                 return $spec_check_exit_status
                 )
 
-                spec_exit_status=$(expr $spec_exit_status + $? || true)
+                local check_exit_status=$?
+
+                spec_exit_status=$(expr $spec_exit_status + $check_exit_status || true)
+                checks_count=$(expr $checks_count + 1) ## checks_count is inherited from the parent scope.
+
+                progress $suites_count $suites_total $specs_count $specs_total $checks_count $checks_total
         done
 
         after_all
@@ -273,17 +299,28 @@ OUT
         return $spec_exit_status
 )}
 
-output()
+log()
 {
-        cat >> "$MessageBuffer"
+        cat >> "$LogBuffer"
+        render
+}
+
+progress()
+{
+        local suites_count="$1"
+        local suites_total="$2"
+        local specs_count="$3"
+        local specs_total="$4"
+        local checks_count="$5"
+        local checks_total="$6"
 
         printf -- "$SpeckProgressStyle" \
-        | sed -e "s:{suites_count}:$suites_count:g" \
-              -e "s:{suites_total}:$suites_total:g" \
-              -e "s:{specs_count}:$specs_count:g" \
-              -e "s:{specs_total}:$specs_total:g" \
-              -e "s:{checks_count}:$checks_count:g" \
-              -e "s:{checks_total}:$checks_total:g" \
+        | sed -e "s|{suites_count}|$suites_count|g" \
+              -e "s|{suites_total}|$suites_total|g" \
+              -e "s|{specs_count}|$specs_count|g" \
+              -e "s|{specs_total}|$specs_total|g" \
+              -e "s|{checks_count}|$checks_count|g" \
+              -e "s|{checks_total}|$checks_total|g" \
         > "$ProgressBuffer"
 
         render
@@ -291,13 +328,19 @@ output()
 
 render()
 {
-        tput civis
-        tput cup 0 0
-        tput il $(tput lines) # tput ed
-        cat "$MessageBuffer"
+        ## We clear the last line because clearing the entire screen causes glitches.
+        tput cuu1       ## One line up.
+        tput cuu1       ## One line up.
+        # tput el1        ## Clears left.
+        # tput el         ## Clears right.
+        # tput ed         ## Not portable.
+        # tput cd         ## Not portable.
+        tput il $(tput lines)
+        ## The progress line has been reset.
+        tput cup 0 0    ## Moves the cursor to the beginning.
+        cat "$LogBuffer"
         echo
         cat "$ProgressBuffer"
-        tput cnorm
 }
 
 count_lines()
